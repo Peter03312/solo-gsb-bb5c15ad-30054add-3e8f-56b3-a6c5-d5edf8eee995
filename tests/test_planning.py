@@ -13,6 +13,7 @@ from app.planning import (  # noqa: E402
     Pipe,
     evaluate_plan,
     evaluate_restore,
+    evaluate_source_switch,
     recommend_plan,
     validate_import,
     DUPLICATE_NODE_ID,
@@ -27,6 +28,9 @@ from app.planning import (  # noqa: E402
     CLOSE_PIPE_IS_FAULT,
     FAULT_REWATER_RISK,
     NO_FEASIBLE_PLAN,
+    SOURCE_NOT_FOUND,
+    SOURCE_NOT_SWITCHABLE,
+    SOURCE_TARGET_DUPLICATE,
 )
 
 
@@ -435,6 +439,145 @@ class RecommendPlanTests(unittest.TestCase):
         self.assertTrue(check.isolatable)
         self.assertEqual(check.issues, [])
         self.assertEqual(check.affected_sink_ids, result.affected_sink_ids)
+
+
+def build_two_source_demo():
+    """双水源管网：
+
+    S1 --Q1(v)-- C --Q2(v,故障)-- U1
+    S2 --Q3(v)-- C --Q4(v)------ U2
+    两座水源初始均运行；C 为公共连接点。
+    """
+    nodes = {
+        "S1": Node("S1", "source"),
+        "S2": Node("S2", "source"),
+        "C": Node("C", "junction"),
+        "U1": Node("U1", "sink"),
+        "U2": Node("U2", "sink"),
+    }
+    pipes = {
+        "Q1": Pipe("Q1", "S1", "C", has_valve=True),
+        "Q3": Pipe("Q3", "S2", "C", has_valve=True),
+        "Q2": Pipe("Q2", "C", "U1", has_valve=True),
+        "Q4": Pipe("Q4", "C", "U2", has_valve=True),
+    }
+    return nodes, pipes
+
+
+class SourceSwitchPlanningTests(unittest.TestCase):
+    def test_stop_one_source_redundant_supply(self):
+        # 双源顶供：停运 S1，S2 仍供 C，无用水点失供
+        nodes, pipes = build_two_source_demo()
+        result = evaluate_source_switch(nodes, pipes, [("S1", False)])
+        self.assertTrue(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.affected_sink_ids, [])
+        self.assertEqual(result.restored_sink_ids, [])
+
+    def test_stop_all_sources_cuts_every_sink(self):
+        # 允许全网无运行水源：全部 sink 新增失供
+        nodes, pipes = build_two_source_demo()
+        result = evaluate_source_switch(
+            nodes, pipes, [("S1", False), ("S2", False)]
+        )
+        self.assertTrue(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.affected_sink_ids, ["U1", "U2"])
+
+    def test_restore_source_restores_sinks(self):
+        # 两源全停后恢复 S1：U1/U2 恢复
+        nodes, pipes = build_two_source_demo()
+        for sid in ("S1", "S2"):
+            nodes[sid] = Node(sid, "source", running=False)
+        result = evaluate_source_switch(nodes, pipes, [("S1", True)])
+        self.assertTrue(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.restored_sink_ids, ["U1", "U2"])
+        self.assertEqual(result.affected_sink_ids, [])
+
+    def test_noop_when_target_states_already_satisfied(self):
+        nodes, pipes = build_two_source_demo()
+        # 已运行 -> 运行；已停运 -> 停运：changed=False
+        nodes["S2"] = Node("S2", "source", running=False)
+        result = evaluate_source_switch(
+            nodes, pipes, [("S1", True), ("S2", False)]
+        )
+        self.assertFalse(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.affected_sink_ids, [])
+        self.assertEqual(result.restored_sink_ids, [])
+
+    def test_invalid_targets_not_found_non_source_duplicate(self):
+        nodes, pipes = build_two_source_demo()
+        result = evaluate_source_switch(
+            nodes,
+            pipes,
+            [("SX", False), ("U1", False), ("S1", False), ("S1", True)],
+        )
+        codes = [i.code for i in result.issues]
+        self.assertEqual(
+            codes,
+            [
+                SOURCE_NOT_FOUND,
+                SOURCE_NOT_SWITCHABLE,
+                SOURCE_TARGET_DUPLICATE,
+            ],
+        )
+        self.assertFalse(result.safe)
+        self.assertFalse(result.changed)
+
+    def test_restore_source_rewaters_pending_fault(self):
+        # S2 停运、Q1 关闭隔离待修复故障 Q2（C/U1 均不可达）；
+        # 恢复 S2 -> Q2 的 C 端重新进水，不安全；U2 恢复（Q2 仍阻断 U1）
+        nodes, pipes = build_two_source_demo()
+        nodes["S2"] = Node("S2", "source", running=False)
+        pipes["Q1"] = Pipe("Q1", "S1", "C", has_valve=True, valve_closed=True)
+        result = evaluate_source_switch(
+            nodes,
+            pipes,
+            [("S2", True)],
+            pending_fault_pipe_ids=frozenset({"Q2"}),
+        )
+        self.assertTrue(result.changed)
+        self.assertFalse(result.safe)
+        self.assertEqual(len(result.blocks), 1)
+        block = result.blocks[0]
+        self.assertEqual(block.fault_pipe_id, "Q2")
+        self.assertEqual(block.reachable_endpoints, ["C"])
+        self.assertEqual(block.as_dict()["code"], FAULT_REWATER_RISK)
+        self.assertEqual(result.restored_sink_ids, ["U2"])
+
+    def test_stop_source_never_introduces_risk(self):
+        # 同一状态下停运 S1：可达范围只收缩，不产生重新进水风险
+        nodes, pipes = build_two_source_demo()
+        nodes["S2"] = Node("S2", "source", running=False)
+        pipes["Q1"] = Pipe("Q1", "S1", "C", has_valve=True, valve_closed=True)
+        result = evaluate_source_switch(
+            nodes,
+            pipes,
+            [("S1", False)],
+            pending_fault_pipe_ids=frozenset({"Q2"}),
+        )
+        self.assertTrue(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.blocks, [])
+
+    def test_stopped_source_excluded_from_all_reachability(self):
+        # 停运 S1 后：隔离/建议只需切断 S2 一路（关 Q3 即可隔离 C），
+        # 且 Q1（停运源侧）不在建议中
+        nodes, pipes = build_two_source_demo()
+        nodes["S1"] = Node("S1", "source", running=False)
+        plan = evaluate_plan(nodes, pipes, "Q2", ["Q3"])
+        self.assertTrue(plan.isolatable)
+        self.assertEqual(plan.affected_sink_ids, ["U1", "U2"])
+        rec = recommend_plan(nodes, pipes, "Q2")
+        self.assertTrue(rec.feasible)
+        self.assertEqual(rec.recommended_close_pipe_ids, ["Q3"])
+        # 两座水源都停运：故障端本就不可达，空方案即可“隔离”，无可达水源
+        nodes["S2"] = Node("S2", "source", running=False)
+        plan = evaluate_plan(nodes, pipes, "Q2", [])
+        self.assertTrue(plan.isolatable)
+        self.assertEqual(plan.affected_sink_ids, [])
 
 
 if __name__ == "__main__":

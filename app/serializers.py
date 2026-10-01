@@ -1,9 +1,16 @@
 """领域对象 -> 响应 dict 的转换。"""
-from .planning import Node, Pipe, PlanResult, RecommendResult, RestoreResult
+from .planning import (
+    Node,
+    Pipe,
+    PlanResult,
+    RecommendResult,
+    RestoreResult,
+    SourceSwitchResult,
+)
 
 
 def serialize_node(node: Node) -> dict:
-    return {"id": node.id, "type": node.type, "name": node.name}
+    return {"id": node.id, "type": node.type, "name": node.name, "running": node.running}
 
 
 def serialize_pipe(pipe: Pipe) -> dict:
@@ -77,4 +84,25 @@ def serialize_recommend(
         "recommended_close_pipe_ids": list(result.recommended_close_pipe_ids),
         "affected_sink_ids": list(result.affected_sink_ids),
         "reason": result.reason.as_dict() if result.reason else None,
+    }
+
+
+def serialize_source_switch_preview(
+    version: int,
+    expected_version: int,
+    result: SourceSwitchResult,
+) -> dict:
+    return {
+        "version": version,
+        "version_match": version == expected_version,
+        "changed": result.changed,
+        "safe": result.safe,
+        "targets": [
+            {"source_id": source_id, "running": running}
+            for source_id, running in result.targets
+        ],
+        "affected_sink_ids": list(result.affected_sink_ids),
+        "restored_sink_ids": list(result.restored_sink_ids),
+        "block_reasons": [b.as_dict() for b in result.blocks],
+        "issues": [i.as_dict() for i in result.issues],
     }

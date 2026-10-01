@@ -27,10 +27,15 @@ VALUES (1, 0)
 ON CONFLICT (id) DO NOTHING;
 
 CREATE TABLE IF NOT EXISTS nodes (
-    id     TEXT PRIMARY KEY,
-    type   TEXT NOT NULL CHECK (type IN ('source', 'sink', 'junction')),
-    name   TEXT
+    id      TEXT PRIMARY KEY,
+    type    TEXT NOT NULL CHECK (type IN ('source', 'sink', 'junction')),
+    name    TEXT,
+    running BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+-- 兼容旧库：建表后补齐水源运行状态列（旧库水源视为运行中）
+ALTER TABLE nodes
+    ADD COLUMN IF NOT EXISTS running BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE TABLE IF NOT EXISTS pipes (
     id           TEXT PRIMARY KEY,
@@ -133,9 +138,11 @@ def load_snapshot(conn, *, for_update: bool = False) -> tuple[int, datetime | No
         version = row["version"] if row else 0
         updated_at = row["updated_at"] if row else None
 
-        cur.execute("SELECT id, type, name FROM nodes")
+        cur.execute("SELECT id, type, name, running FROM nodes")
         nodes = {
-            r["id"]: Node(id=r["id"], type=r["type"], name=r["name"])
+            r["id"]: Node(
+                id=r["id"], type=r["type"], name=r["name"], running=r["running"]
+            )
             for r in cur.fetchall()
         }
 
@@ -176,8 +183,9 @@ def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> int:
         cur.execute("TRUNCATE nodes")
 
         cur.executemany(
-            "INSERT INTO nodes (id, type, name) VALUES (%s, %s, %s)",
-            [(n.id, n.type, n.name) for n in nodes],
+            "INSERT INTO nodes (id, type, name, running) "
+            "VALUES (%s, %s, %s, %s)",
+            [(n.id, n.type, n.name, n.running) for n in nodes],
         )
         cur.executemany(
             "INSERT INTO pipes (id, from_node, to_node, has_valve, valve_closed, name) "
@@ -255,6 +263,46 @@ class VersionConflict(Exception):
         self.current = current
         self.expected = expected
         super().__init__(f"版本过期：当前版本 {current}，提交基于版本 {expected}")
+
+
+# ---------------------------------------------------------------- 水源状态切换
+
+
+def switch_sources(
+    conn,
+    expected_version: int,
+    targets: list[tuple[str, bool]],
+) -> dict:
+    """在已开启的事务中原子完成水源运行状态切换。
+
+    调用方须先用当前快照完成结构与安全性复核（仅水源可切换、无重复、
+    切换后待修复故障无重新进水风险）。
+    本函数只负责：锁版本行 → 版本比对 → 更新水源状态 → 版本 +1。
+    版本过期抛出 VersionConflict；无实际变化不应调用本函数。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
+        row = cur.fetchone()
+        current_version = row[0] if row else 0
+        if current_version != expected_version:
+            raise VersionConflict(current_version, expected_version)
+
+        for source_id, running in targets:
+            # 仅水源节点可切换（调用方已复核，SQL 再约束一次防止部分写入）
+            cur.execute(
+                "UPDATE nodes SET running = %s WHERE id = %s AND type = 'source'",
+                (running, source_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(f"水源节点不存在或不可切换：{source_id}")
+
+        new_version = current_version + 1
+        cur.execute(
+            "UPDATE network_meta SET version = %s, updated_at = now() WHERE id = 1",
+            (new_version,),
+        )
+
+    return {"version": new_version}
 
 
 # ---------------------------------------------------------------- 复供

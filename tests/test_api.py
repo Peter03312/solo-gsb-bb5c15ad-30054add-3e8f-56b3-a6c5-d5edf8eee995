@@ -157,6 +157,19 @@ def fake_confirm_restore(
     return {"version": STORE.version, "restored_at": restored_at}
 
 
+def fake_switch_sources(conn, expected_version, targets):
+    # 复制 db.switch_sources 的关键语义：锁行版本比对 -> 更新水源运行状态 -> +1
+    if STORE.version != expected_version:
+        raise db.VersionConflict(STORE.version, expected_version)
+    for source_id, running in targets:
+        node = STORE.nodes.get(source_id)
+        if node is None or node.type != "source":
+            raise RuntimeError(f"水源节点不存在或不可切换：{source_id}")
+        STORE.nodes[source_id] = Node(node.id, node.type, node.name, running)
+    STORE.version += 1
+    return {"version": STORE.version}
+
+
 # 替换数据访问层
 db.get_conn = fake_get_conn
 db.transaction = fake_transaction
@@ -168,6 +181,7 @@ db.list_events = fake_list_events
 db.get_event = fake_get_event
 db.list_open_events = fake_list_open_events
 db.confirm_restore = fake_confirm_restore
+db.switch_sources = fake_switch_sources
 
 
 VALID_NETWORK = {
@@ -217,6 +231,26 @@ RESTORE_NETWORK = {
 }
 
 
+# 双水源管网（演示水源停运/恢复）：
+# S1 --Q1[阀]-- C --Q2[阀]-- U1
+# S2 --Q3[阀]-- C --Q4[阀]-- U2
+TWO_SOURCE_NETWORK = {
+    "nodes": [
+        {"id": "S1", "type": "source"},
+        {"id": "S2", "type": "source"},
+        {"id": "C", "type": "junction"},
+        {"id": "U1", "type": "sink"},
+        {"id": "U2", "type": "sink"},
+    ],
+    "pipes": [
+        {"id": "Q1", "from": "S1", "to": "C", "has_valve": True},
+        {"id": "Q3", "from": "S2", "to": "C", "has_valve": True},
+        {"id": "Q2", "from": "C", "to": "U1", "has_valve": True},
+        {"id": "Q4", "from": "C", "to": "U2", "has_valve": True},
+    ],
+}
+
+
 class ApiTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -258,6 +292,11 @@ class ApiTests(unittest.TestCase):
         # 无阀管段 valve_closed 序列化为 null
         p6 = next(p for p in body["pipes"] if p["id"] == "P6")
         self.assertIsNone(p6["valve_closed"])
+        # 导入的水源初始视为运行；非水源节点 running 恒为 true
+        src = next(n for n in body["nodes"] if n["id"] == "S")
+        self.assertTrue(src["running"])
+        u1 = next(n for n in body["nodes"] if n["id"] == "U1")
+        self.assertTrue(u1["running"])
 
         # 不可行预演
         r = self.client.post(
@@ -814,6 +853,293 @@ class ApiTests(unittest.TestCase):
         )
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.json()["error"]["code"], "EVENT_NOT_FOUND")
+
+    # ---------------------------------------------------------- 水源状态切换
+
+    def test_imported_sources_initially_running(self):
+        r = self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        self.assertEqual(r.status_code, 200, r.text)
+        nodes = {n["id"]: n for n in self.client.get("/api/network").json()["nodes"]}
+        self.assertTrue(nodes["S1"]["running"])
+        self.assertTrue(nodes["S2"]["running"])
+
+    def test_switch_preview_stop_one_source_is_read_only(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 停运 S1：S2 经 C 顶供，全部用水点仍可达，无新增失供
+        r = self.client.post(
+            "/api/sources/switch/preview",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 1)
+        self.assertTrue(body["version_match"])
+        self.assertTrue(body["changed"])
+        self.assertTrue(body["safe"])
+        self.assertEqual(body["targets"], [{"source_id": "S1", "running": False}])
+        self.assertEqual(body["affected_sink_ids"], [])
+        self.assertEqual(body["restored_sink_ids"], [])
+        self.assertEqual(body["block_reasons"], [])
+        self.assertEqual(body["issues"], [])
+        # 只读：版本与水源状态不变
+        self.assertEqual(STORE.version, 1)
+        self.assertTrue(STORE.nodes["S1"].running)
+
+    def test_switch_confirm_stop_all_sources_cuts_all_sinks(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 同时停运两座水源：允许全网无运行水源，U1/U2 全部新增失供
+        r = self.client.post(
+            "/api/sources/switch",
+            json={
+                "targets": [
+                    {"source_id": "S1", "running": False},
+                    {"source_id": "S2", "running": False},
+                ],
+                "version": 1,
+            },
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["changed"])
+        self.assertEqual(body["version"], 2)
+        self.assertEqual(body["affected_sink_ids"], ["U1", "U2"])
+        self.assertEqual(body["restored_sink_ids"], [])
+        # 水源状态落库
+        self.assertFalse(STORE.nodes["S1"].running)
+        self.assertFalse(STORE.nodes["S2"].running)
+
+    def test_switch_restore_source_restores_sinks(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 停运全部 -> 恢复 S1：U1/U2 恢复供水，版本 3
+        self.client.post(
+            "/api/sources/switch",
+            json={
+                "targets": [
+                    {"source_id": "S1", "running": False},
+                    {"source_id": "S2", "running": False},
+                ],
+                "version": 1,
+            },
+        )
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": True}], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["version"], 3)
+        self.assertEqual(body["restored_sink_ids"], ["U1", "U2"])
+        self.assertEqual(body["affected_sink_ids"], [])
+        self.assertTrue(STORE.nodes["S1"].running)
+        self.assertFalse(STORE.nodes["S2"].running)
+
+    def test_switch_noop_does_not_advance_version(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 目标状态全部已满足：changed=false，版本不变（预演与确认一致）
+        r = self.client.post(
+            "/api/sources/switch/preview",
+            json={"targets": [{"source_id": "S1", "running": True}], "version": 1},
+        )
+        body = r.json()
+        self.assertFalse(body["changed"])
+        self.assertTrue(body["safe"])
+
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": True}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertFalse(body["changed"])
+        self.assertEqual(body["version"], 1)
+        self.assertEqual(STORE.version, 1)
+        self.assertTrue(STORE.nodes["S1"].running)
+
+    def test_switch_invalid_source_in_preview_and_confirm(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 预演：编号不存在 / 非水源节点 / 同批重复，进入 issues（只读，200）
+        r = self.client.post(
+            "/api/sources/switch/preview",
+            json={
+                "targets": [
+                    {"source_id": "SX", "running": False},
+                    {"source_id": "U1", "running": False},
+                    {"source_id": "S1", "running": False},
+                    {"source_id": "S1", "running": True},
+                ],
+                "version": 1,
+            },
+        )
+        self.assertEqual(r.status_code, 200)
+        codes = {i["code"] for i in r.json()["issues"]}
+        self.assertIn("SOURCE_NOT_FOUND", codes)
+        self.assertIn("SOURCE_NOT_SWITCHABLE", codes)
+        self.assertIn("SOURCE_TARGET_DUPLICATE", codes)
+        self.assertFalse(r.json()["safe"])
+        self.assertEqual(STORE.version, 1)
+
+        # 确认：结构问题 -> 422 SOURCE_SWITCH_INVALID，无部分写入
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "SX", "running": False}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "SOURCE_SWITCH_INVALID")
+        self.assertIn("SOURCE_NOT_FOUND", r.text)
+        self.assertEqual(STORE.version, 1)
+
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "U1", "running": False}], "version": 1},
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("SOURCE_NOT_SWITCHABLE", r.text)
+
+        r = self.client.post(
+            "/api/sources/switch",
+            json={
+                "targets": [
+                    {"source_id": "S1", "running": False},
+                    {"source_id": "S1", "running": True},
+                ],
+                "version": 1,
+            },
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertIn("SOURCE_TARGET_DUPLICATE", r.text)
+
+    def test_switch_version_conflict(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 99},
+        )
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(r.json()["error"]["code"], "VERSION_CONFLICT")
+        self.assertEqual(STORE.version, 1)
+        self.assertTrue(STORE.nodes["S1"].running)
+        # 预演对过期版本不拒绝，只标记 version_match=false
+        r = self.client.post(
+            "/api/sources/switch/preview",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 99},
+        )
+        self.assertEqual(r.status_code, 200)
+        self.assertFalse(r.json()["version_match"])
+
+    def test_switch_restore_blocked_by_pending_fault_rewater_risk(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 故障 Q2（C-U1，无阀）：C 侧多源，关阀无法隔离（Q1/Q3 都进水），
+        # 先停运 S2 再隔离（停运不推进故障风险，只是改水源运行态）：
+        # 停运 S2 后，C 只由 S1 供水；关 Q1 即可隔离 Q2 的 C 端。
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": False}], "version": 1},
+        )
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "Q2", "close_pipe_ids": ["Q1"], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["event_id"], 1)
+        # 此时待修复故障 Q2 的 C/U1 两端均不可达（S1 被 Q1 关断，S2 停运）
+
+        # 预演恢复 S2：Q2 的 C 端将经 Q3 重新进水 -> safe=false
+        r = self.client.post(
+            "/api/sources/switch/preview",
+            json={"targets": [{"source_id": "S2", "running": True}], "version": 3},
+        )
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["changed"])
+        self.assertFalse(body["safe"])
+        self.assertEqual(len(body["block_reasons"]), 1)
+        block = body["block_reasons"][0]
+        self.assertEqual(block["code"], "FAULT_REWATER_RISK")
+        self.assertEqual(block["pipe_id"], "Q2")
+        self.assertEqual(block["reachable_endpoints"], ["C"])
+        # U2 恢复供水（C 经 S2 进水但 Q2 阻断 U1，故仅 U2）
+        self.assertEqual(body["restored_sink_ids"], ["U2"])
+
+        # 强行确认 -> 422 SOURCE_SWITCH_UNSAFE，无部分写入
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": True}], "version": 3},
+        )
+        self.assertEqual(r.status_code, 422)
+        self.assertEqual(r.json()["error"]["code"], "SOURCE_SWITCH_UNSAFE")
+        self.assertIn("FAULT_REWATER_RISK", r.text)
+        self.assertEqual(STORE.version, 3)
+        self.assertFalse(STORE.nodes["S2"].running)
+
+    def test_switch_stop_source_is_always_safe(self):
+        # 停运只会收缩可达范围：有待修复故障时停运水源也不会引入重新进水风险。
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 停运 S2（v2）-> 关 Q1 隔离待修复故障 Q2（v3）：C 两侧均断开
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S2", "running": False}], "version": 1},
+        )
+        r = self.client.post(
+            "/api/isolation/submit",
+            json={"fault_pipe_id": "Q2", "close_pipe_ids": ["Q1"], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        # 再停运仍在运行的 S1：运行状态发生变化（changed=true），
+        # 但 C 此前已不可达，无新增失供、无重新进水风险，版本推进到 4
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 3},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["changed"])
+        self.assertEqual(body["affected_sink_ids"], [])
+        self.assertEqual(body["restored_sink_ids"], [])
+        self.assertEqual(body["version"], 4)
+        self.assertFalse(STORE.nodes["S1"].running)
+        self.assertFalse(STORE.nodes["S2"].running)
+
+    def test_isolation_and_recommend_ignore_stopped_sources(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # 停运 S1 后，对 Q2（C-U1）做隔离：只有 S2 仍供水，关 Q3 即可隔离 C
+        self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": 1},
+        )
+        r = self.client.post(
+            "/api/isolation/preview",
+            json={"fault_pipe_id": "Q2", "close_pipe_ids": ["Q3"], "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertTrue(body["isolatable"])
+        self.assertEqual(body["affected_sink_ids"], ["U1", "U2"])
+
+        # 关阀建议同样只按运行水源计算：建议关 Q3（而非停运的 S1 侧 Q1）
+        r = self.client.post(
+            "/api/isolation/recommend",
+            json={"fault_pipe_id": "Q2", "version": 2},
+        )
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["recommended_close_pipe_ids"], ["Q3"])
+
+    def test_switch_request_body_validation_422(self):
+        self.client.post("/api/network/import", json=TWO_SOURCE_NETWORK)
+        # targets 不能为空
+        r = self.client.post(
+            "/api/sources/switch/preview", json={"targets": [], "version": 1}
+        )
+        self.assertEqual(r.status_code, 422)
+        # version 不允许负数 / 缺字段
+        r = self.client.post(
+            "/api/sources/switch",
+            json={"targets": [{"source_id": "S1", "running": False}], "version": -1},
+        )
+        self.assertEqual(r.status_code, 422)
+        r = self.client.post(
+            "/api/sources/switch", json={"targets": [{"running": False}], "version": 1}
+        )
+        self.assertEqual(r.status_code, 422)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,15 @@
 - 只能从尚未关闭的有阀管段中选取（不含故障管段本身），方案须使故障管段两端
   都与所有水源断开；优选顺序：新增失供用水点数最少 → 本次关阀数最少 →
   关阀编号序列字典序最小。
+
+水源状态（source running）规则：
+- 每个水源节点有运行(running)/停运(stopped)状态；整网导入时水源初始视为运行。
+- 可达性计算只从“运行中”的水源出发（停运水源不再向管网供水）；
+  读网、隔离预演/提交、关阀建议、复供预演/确认全部按运行水源计算。
+- 水源切换预演为只读：返回当前版本、版本是否匹配、切换后新增失供与恢复供水的
+  用水点，以及每条待修复故障管段的重新进水风险；仅水源节点可切换，同批编号
+  不得重复；全部目标状态已满足（无实际变化）时不推进版本；停运可导致全网无
+  运行水源（此时所有用水点失供，不额外报错）。
 """
 from __future__ import annotations
 
@@ -46,6 +55,11 @@ PIPE_SELF_LOOP = "PIPE_SELF_LOOP"
 PIPE_ENDPOINT_UNKNOWN = "PIPE_ENDPOINT_UNKNOWN"
 NON_VALVE_PIPE_CLOSED = "NON_VALVE_PIPE_CLOSED"
 
+# 水源切换问题
+SOURCE_NOT_FOUND = "SOURCE_NOT_FOUND"          # 编号不存在
+SOURCE_NOT_SWITCHABLE = "SOURCE_NOT_SWITCHABLE"  # 节点存在但不是水源，不可切换
+SOURCE_TARGET_DUPLICATE = "SOURCE_TARGET_DUPLICATE"  # 同批水源编号重复
+
 # 结构性阻断问题（预演会给出，提交据此拒绝）
 BLOCKING_ISSUE_CODES = frozenset(
     {
@@ -63,6 +77,8 @@ class Node:
     id: str
     type: str  # source / sink / junction
     name: str | None = None
+    # 仅水源节点有意义：True=运行（供水），False=停运。导入的水源初始为运行。
+    running: bool = True
 
 
 @dataclass(frozen=True)
@@ -120,6 +136,45 @@ class RestoreResult:
     blocks: list[ReopenBlock] = field(default_factory=list)
     # 复供评估中仍不可通行的管段（其他待修复故障管段 ∪ 仍关闭阀门）
     blocked_pipe_ids: frozenset[str] = field(default_factory=frozenset)
+
+
+@dataclass
+class SourceSwitchBlock:
+    """水源切换阻断：切换后某条待修复故障管段有一端将重新进水。"""
+
+    fault_pipe_id: str
+    reachable_endpoints: list[str]
+
+    def as_dict(self) -> dict:
+        return {
+            "code": FAULT_REWATER_RISK,
+            "message": (
+                f"切换后，待修复故障管段 {self.fault_pipe_id} 的 "
+                f"{ '、'.join(self.reachable_endpoints) } 端将重新进水，禁止切换水源状态"
+            ),
+            "pipe_id": self.fault_pipe_id,
+            "reachable_endpoints": list(self.reachable_endpoints),
+        }
+
+
+@dataclass
+class SourceSwitchResult:
+    """水源状态切换预演结果（只读计算，不改任何状态）。
+
+    - changed：是否存在实际状态变化；全部目标状态已满足时为 False，确认不推进版本；
+    - affected_sink_ids：切换后“新增失供”的用水点（切换前可达、切换后不可达）；
+    - restored_sink_ids：切换后“恢复供水”的用水点（切换前不可达、切换后可达）；
+    - blocks：每条待修复故障管段在切换后的重新进水风险（任一端可达即列入）；
+    存在风险时 safe=False，确认接口据此拒绝（422 SOURCE_SWITCH_UNSAFE）。
+    """
+
+    changed: bool
+    safe: bool
+    targets: list[tuple[str, bool]]
+    affected_sink_ids: list[str]
+    restored_sink_ids: list[str]
+    blocks: list[SourceSwitchBlock] = field(default_factory=list)
+    issues: list[Issue] = field(default_factory=list)
 
 
 @dataclass
@@ -223,12 +278,20 @@ def _reachable(
     pipes: list[Pipe],
     removed_pipe_ids: frozenset[str],
 ) -> set[str]:
-    """无向 BFS：从全部水源出发，返回可达节点集合。"""
+    """无向 BFS：从全部“运行中”的水源出发，返回可达节点集合。
+
+    停运(running=False)的水源不供水，不作为通水起点，因此读网、隔离、
+    关阀建议与复供的通水判断均按运行水源计算。
+    """
     return _reachable_from(
         nodes,
         pipes,
         removed_pipe_ids,
-        [nid for nid, node in nodes.items() if node.type == "source"],
+        [
+            nid
+            for nid, node in nodes.items()
+            if node.type == "source" and node.running
+        ],
     )
 
 
@@ -516,4 +579,134 @@ def recommend_plan(
         feasible=True,
         recommended_close_pipe_ids=best[1],
         affected_sink_ids=best[2],
+    )
+
+
+# ---------------------------------------------------------------- 水源状态切换
+
+
+def validate_source_targets(
+    nodes: dict[str, Node],
+    targets: list[tuple[str, bool]],
+) -> list[Issue]:
+    """校验水源切换请求本身：编号存在、节点是水源、同批不重复。"""
+    issues: list[Issue] = []
+    seen: set[str] = set()
+    for source_id, _running in targets:
+        if source_id in seen:
+            issues.append(
+                Issue(
+                    SOURCE_TARGET_DUPLICATE,
+                    f"同批水源编号不得重复：{source_id}",
+                    source_id,
+                )
+            )
+            continue
+        seen.add(source_id)
+
+        node = nodes.get(source_id)
+        if node is None:
+            issues.append(
+                Issue(SOURCE_NOT_FOUND, f"水源节点不存在：{source_id}", source_id)
+            )
+        elif node.type != "source":
+            issues.append(
+                Issue(
+                    SOURCE_NOT_SWITCHABLE,
+                    f"节点 {source_id} 不是水源，仅水源节点可切换运行状态",
+                    source_id,
+                )
+            )
+    return issues
+
+
+def evaluate_source_switch(
+    nodes: dict[str, Node],
+    pipes: dict[str, Pipe],
+    targets: list[tuple[str, bool]],
+    *,
+    pending_fault_pipe_ids: frozenset[str] = frozenset(),
+) -> SourceSwitchResult:
+    """评估水源运行状态切换（只读，不改任何状态）。
+
+    targets：(水源编号, 目标运行状态) 列表，True=恢复运行、False=停运。
+    pending_fault_pipe_ids：待修复(open)隔离事件的故障管段，通水时仍视为不可通行
+    （已关闭阀门同样阻断）。
+
+    返回：
+    - changed：目标状态与当前是否有差异（无差异确认时不推进版本）；
+    - affected_sink_ids：切换后新增失供用水点（切换前可达 → 切换后不可达）；
+    - restored_sink_ids：切换后恢复供水用水点（切换前不可达 → 切换后可达）；
+    - blocks：切换后每条待修复故障管段的重新进水风险（任一端从运行水源可达）。
+      停运只会收缩可达范围，不会引入风险；风险只可能由恢复水源引发。
+    """
+    issues = validate_source_targets(nodes, targets)
+    if issues:
+        return SourceSwitchResult(
+            changed=False,
+            safe=False,
+            targets=list(targets),
+            affected_sink_ids=[],
+            restored_sink_ids=[],
+            issues=issues,
+        )
+
+    pipe_list = list(pipes.values())
+    already_closed = frozenset(p.id for p in pipe_list if p.has_valve and p.valve_closed)
+    pending_faults = frozenset(pid for pid in pending_fault_pipe_ids if pid in pipes)
+    blocked = already_closed | pending_faults
+
+    target_map = dict(targets)
+    changed = any(nodes[sid].running != running for sid, running in targets)
+
+    # 切换前（当前态）：按当前运行水源计算可达
+    before_reachable = _reachable(nodes, pipe_list, blocked)
+
+    # 切换后：仅水源运行状态改变，管网结构/阀位/故障管段不变
+    switched_nodes = {
+        nid: Node(
+            id=n.id,
+            type=n.type,
+            name=n.name,
+            running=target_map.get(nid, n.running),
+        )
+        for nid, n in nodes.items()
+    }
+    after_reachable = _reachable(switched_nodes, pipe_list, blocked)
+
+    affected = sorted(
+        nid
+        for nid, node in nodes.items()
+        if node.type == "sink" and nid in before_reachable and nid not in after_reachable
+    )
+    restored = sorted(
+        nid
+        for nid, node in nodes.items()
+        if node.type == "sink" and nid not in before_reachable and nid in after_reachable
+    )
+
+    # 每条待修复故障：切换后任一端可从运行水源到达即有重新进水风险
+    blocks: list[SourceSwitchBlock] = []
+    for fid in sorted(pending_faults):
+        fault = pipes[fid]
+        reachable_ends = [
+            end
+            for end in (fault.from_node, fault.to_node)
+            if end in after_reachable
+        ]
+        if reachable_ends:
+            blocks.append(
+                SourceSwitchBlock(
+                    fault_pipe_id=fid, reachable_endpoints=reachable_ends
+                )
+            )
+
+    return SourceSwitchResult(
+        changed=changed,
+        safe=not blocks,
+        targets=list(targets),
+        affected_sink_ids=affected,
+        restored_sink_ids=restored,
+        blocks=blocks,
+        issues=[],
     )

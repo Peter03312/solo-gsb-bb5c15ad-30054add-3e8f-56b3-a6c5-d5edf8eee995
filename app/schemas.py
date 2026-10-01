@@ -56,6 +56,24 @@ class RecommendIn(BaseModel):
     version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
 
 
+class SourceTargetIn(BaseModel):
+    """单个水源的目标运行状态。"""
+
+    source_id: str = Field(min_length=1, description="水源节点编号")
+    running: bool = Field(description="目标运行状态：true 恢复运行，false 停运")
+
+    model_config = {"extra": "forbid"}
+
+
+class SourceSwitchIn(BaseModel):
+    """水源状态切换预演 / 确认入参：一批水源及各自目标运行状态 + 已读版本。"""
+
+    targets: list[SourceTargetIn] = Field(
+        min_length=1, description="水源编号与目标运行状态列表（同批编号不得重复）"
+    )
+    version: int = Field(ge=0, description="读取管网时的版本号，空网为 0")
+
+
 # ---------------------------------------------------------------- 响应模型
 
 
@@ -63,6 +81,8 @@ class NodeOut(BaseModel):
     id: str
     type: NodeType
     name: str | None = None
+    # 仅水源节点有意义：true=运行中，false=已停运；非水源节点恒为 true
+    running: bool = True
 
 
 class PipeOut(BaseModel):
@@ -159,6 +179,31 @@ class RestoreOut(BaseModel):
     status: str
     fault_pipe_id: str
     reopened_pipe_ids: list[str]
+    restored_sink_ids: list[str]
+
+
+class SourceTargetOut(BaseModel):
+    source_id: str
+    running: bool
+
+
+class SourceSwitchPreviewOut(BaseModel):
+    version: int
+    version_match: bool
+    changed: bool
+    safe: bool
+    targets: list[SourceTargetOut]
+    affected_sink_ids: list[str]
+    restored_sink_ids: list[str]
+    block_reasons: list[ReopenBlockOut]
+    issues: list[IssueOut]
+
+
+class SourceSwitchOut(BaseModel):
+    version: int
+    changed: bool
+    targets: list[SourceTargetOut]
+    affected_sink_ids: list[str]
     restored_sink_ids: list[str]
 
 

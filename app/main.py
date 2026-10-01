@@ -10,6 +10,8 @@
 - GET  /api/isolation/events                           隔离/复供操作历史
 - POST /api/isolation/events/{event_id}/restore/preview 复供预演（只读）
 - POST /api/isolation/events/{event_id}/restore        复供确认（单事务复核 + 重开阀门）
+- POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
+- POST /api/sources/switch                             水源停运/恢复确认（单事务复核 + 原子改状态）
 """
 from contextlib import asynccontextmanager
 
@@ -23,6 +25,7 @@ from .planning import (
     Pipe,
     evaluate_plan,
     evaluate_restore,
+    evaluate_source_switch,
     recommend_plan,
     validate_import,
     BLOCKING_ISSUE_CODES,
@@ -32,6 +35,7 @@ from .schemas import (
     PlanIn,
     RecommendIn,
     RestoreIn,
+    SourceSwitchIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -39,12 +43,15 @@ from .schemas import (
     SubmitOut,
     RestorePreviewOut,
     RestoreOut,
+    SourceSwitchPreviewOut,
+    SourceSwitchOut,
     EventOut,
 )
 from .serializers import (
     serialize_preview,
     serialize_recommend,
     serialize_restore_preview,
+    serialize_source_switch_preview,
     serialize_snapshot,
 )
 
@@ -362,3 +369,90 @@ def restore_confirm(event_id: int, payload: RestoreIn):
         "reopened_pipe_ids": reopen_ids,
         "restored_sink_ids": result.restored_sink_ids,
     }
+
+
+# ---------------------------------------------------------------- 水源状态切换
+
+
+def _load_source_switch_context(conn, payload: SourceSwitchIn, *, for_update: bool = False):
+    """读取快照、待修复故障并评估水源切换。返回 (version, result, targets)。"""
+    version, _updated_at, nodes, pipes = db.load_snapshot(conn, for_update=for_update)
+    pending_fault_ids = frozenset(
+        e["fault_pipe_id"] for e in db.list_open_events(conn)
+    )
+    targets = [(t.source_id, t.running) for t in payload.targets]
+    result = evaluate_source_switch(
+        nodes,
+        pipes,
+        targets,
+        pending_fault_pipe_ids=pending_fault_ids,
+    )
+    return version, result, targets
+
+
+def _switch_response_body(version: int, targets, result) -> dict:
+    return {
+        "version": version,
+        "changed": result.changed,
+        "targets": [
+            {"source_id": source_id, "running": running}
+            for source_id, running in targets
+        ],
+        "affected_sink_ids": result.affected_sink_ids,
+        "restored_sink_ids": result.restored_sink_ids,
+    }
+
+
+@app.post(
+    "/api/sources/switch/preview",
+    response_model=SourceSwitchPreviewOut,
+    tags=["水源调度"],
+    summary="水源停运/恢复预演：失供与恢复用水点、待修复故障重新进水风险（只读）",
+)
+def source_switch_preview(payload: SourceSwitchIn):
+    with db.get_conn() as conn:
+        version, result, targets = _load_source_switch_context(conn, payload)
+
+    return serialize_source_switch_preview(version, payload.version, result)
+
+
+@app.post(
+    "/api/sources/switch",
+    response_model=SourceSwitchOut,
+    tags=["水源调度"],
+    summary="水源停运/恢复确认：锁版本复核安全性，原子更新水源状态与版本",
+)
+def source_switch_confirm(payload: SourceSwitchIn):
+    with db.transaction() as conn:
+        # 锁定版本行后基于最新状态复核，保证不产生部分变更
+        version, result, targets = _load_source_switch_context(
+            conn, payload, for_update=True
+        )
+
+        if version != payload.version:
+            raise db.VersionConflict(version, payload.version)
+        if result.issues:
+            raise ApiError(
+                422,
+                "SOURCE_SWITCH_INVALID",
+                "水源切换请求非法（编号不存在、节点不是水源或同批编号重复）",
+                issues=result.issues,
+            )
+
+        # 全部目标状态已满足：不推进版本，直接回显当前状态
+        if not result.changed:
+            return _switch_response_body(version, targets, result)
+
+        if not result.safe:
+            raise ApiError(
+                422,
+                "SOURCE_SWITCH_UNSAFE",
+                "水源切换存在重新进水风险：恢复水源后待修复故障管段的端点将重新通水",
+                issues=result.blocks,
+            )
+
+        outcome = db.switch_sources(
+            conn, expected_version=payload.version, targets=targets
+        )
+
+    return _switch_response_body(outcome["version"], targets, result)
