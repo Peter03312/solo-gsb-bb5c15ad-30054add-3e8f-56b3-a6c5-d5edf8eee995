@@ -1,15 +1,19 @@
-"""供水管网故障隔离服务 —— FastAPI 入口。
+"""供水管网故障隔离与水源调度服务 —— FastAPI 入口。
 
 接口前缀 /api：
 - GET  /health                                         健康检查
 - POST /api/network/import                             整网导入（替换式，版本重置为 1）
 - GET  /api/network                                    读取当前管网与版本
+- POST /api/sources/switch/preview                     水源停运/恢复预演（只读）
+- POST /api/sources/switch                             水源停运/恢复确认（原子更新水源状态与版本）
 - POST /api/isolation/recommend                        关阀建议（只读，按当前管网计算可提交方案）
 - POST /api/isolation/preview                          隔离方案预演（只读）
 - POST /api/isolation/submit                           隔离方案提交（原子关阀 + 版本 +1）
 - GET  /api/isolation/events                           隔离/复供操作历史
 - POST /api/isolation/events/{event_id}/restore/preview 复供预演（只读）
 - POST /api/isolation/events/{event_id}/restore        复供确认（单事务复核 + 重开阀门）
+
+全部通水计算（读网、关阀建议、隔离预演/提交、复供）均只以**运行中**水源为种子。
 """
 from contextlib import asynccontextmanager
 
@@ -23,15 +27,18 @@ from .planning import (
     Pipe,
     evaluate_plan,
     evaluate_restore,
+    evaluate_source_switch,
     recommend_plan,
     validate_import,
     BLOCKING_ISSUE_CODES,
+    SOURCE_SWITCH_ISSUE_CODES,
 )
 from .schemas import (
     ImportIn,
     PlanIn,
     RecommendIn,
     RestoreIn,
+    SourceSwitchIn,
     ImportOut,
     NetworkOut,
     PreviewOut,
@@ -39,12 +46,15 @@ from .schemas import (
     SubmitOut,
     RestorePreviewOut,
     RestoreOut,
+    SourceSwitchPreviewOut,
+    SourceSwitchOut,
     EventOut,
 )
 from .serializers import (
     serialize_preview,
     serialize_recommend,
     serialize_restore_preview,
+    serialize_source_switch_preview,
     serialize_snapshot,
 )
 
@@ -154,6 +164,107 @@ def get_network():
     with db.get_conn() as conn:
         version, updated_at, nodes, pipes = db.load_snapshot(conn)
     return serialize_snapshot(version, updated_at, nodes, pipes)
+
+
+# ---------------------------------------------------------------- 水源调度
+
+
+def _source_switches(payload: SourceSwitchIn) -> list[tuple[str, bool]]:
+    return [(item.source_id, item.running) for item in payload.switches]
+
+
+def _load_pending_fault_ids(conn) -> frozenset[str]:
+    """全部待修复(open)事件的故障管段编号（对水源切换安全评估全部计入）。"""
+    return frozenset(e["fault_pipe_id"] for e in db.list_open_events(conn))
+
+
+@app.post(
+    "/api/sources/switch/preview",
+    response_model=SourceSwitchPreviewOut,
+    tags=["水源调度"],
+    summary="水源停运/恢复预演：失供/恢复用水点与重新进水风险（只读）",
+)
+def source_switch_preview(payload: SourceSwitchIn):
+    switches = _source_switches(payload)
+    with db.get_conn() as conn:
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn)
+        pending_fault_ids = _load_pending_fault_ids(conn)
+
+    result = evaluate_source_switch(
+        nodes,
+        pipes,
+        switches,
+        pending_fault_pipe_ids=pending_fault_ids,
+    )
+    return serialize_source_switch_preview(
+        version, payload.version, switches, result
+    )
+
+
+@app.post(
+    "/api/sources/switch",
+    response_model=SourceSwitchOut,
+    tags=["水源调度"],
+    summary="水源停运/恢复确认：锁定版本按最新状态复核，原子更新水源状态与版本",
+)
+def source_switch_confirm(payload: SourceSwitchIn):
+    switches = _source_switches(payload)
+
+    with db.transaction() as conn:
+        # 锁定版本行后基于最新数据复核，保证不产生部分变更
+        version, _updated_at, nodes, pipes = db.load_snapshot(conn, for_update=True)
+
+        if version != payload.version:
+            raise db.VersionConflict(version, payload.version)
+
+        pending_fault_ids = _load_pending_fault_ids(conn)
+
+        result = evaluate_source_switch(
+            nodes,
+            pipes,
+            switches,
+            pending_fault_pipe_ids=pending_fault_ids,
+        )
+
+        invalid = [i for i in result.issues if i.code in SOURCE_SWITCH_ISSUE_CODES]
+        if invalid:
+            raise ApiError(
+                422,
+                "SOURCE_SWITCH_INVALID",
+                "水源切换非法：编号不是水源节点，或同批编号重复",
+                issues=invalid,
+            )
+        if not result.safe:
+            raise ApiError(
+                422,
+                "SOURCE_REWATER_RISK",
+                "恢复水源不安全：待修复故障管段的端点将重新通水",
+                issues=result.blocks,
+            )
+
+        # 仅对目标状态与当前不同的水源更新；全部已满足时 changed_targets 为空，
+        # db.switch_sources 不推进版本（changed=False 的幂等确认）。
+        changed_targets = {
+            sid: running
+            for sid, running in switches
+            if nodes[sid].running != running
+        }
+        new_version = db.switch_sources(
+            conn,
+            expected_version=payload.version,
+            changed_targets=changed_targets,
+        )
+
+    return {
+        "version": new_version,
+        "switches": [
+            {"source_id": sid, "running": running} for sid, running in switches
+        ],
+        "changed": result.changed,
+        "new_loss_sink_ids": result.new_loss_sink_ids,
+        "restored_sink_ids": result.restored_sink_ids,
+        "running_source_ids": result.running_source_ids,
+    }
 
 
 # ---------------------------------------------------------------- 隔离

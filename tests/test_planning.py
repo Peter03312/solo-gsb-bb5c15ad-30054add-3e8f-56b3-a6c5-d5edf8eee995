@@ -13,6 +13,7 @@ from app.planning import (  # noqa: E402
     Pipe,
     evaluate_plan,
     evaluate_restore,
+    evaluate_source_switch,
     recommend_plan,
     validate_import,
     DUPLICATE_NODE_ID,
@@ -27,6 +28,8 @@ from app.planning import (  # noqa: E402
     CLOSE_PIPE_IS_FAULT,
     FAULT_REWATER_RISK,
     NO_FEASIBLE_PLAN,
+    SOURCE_NOT_FOUND,
+    SOURCE_SWITCH_DUPLICATE,
 )
 
 
@@ -435,6 +438,170 @@ class RecommendPlanTests(unittest.TestCase):
         self.assertTrue(check.isolatable)
         self.assertEqual(check.issues, [])
         self.assertEqual(check.affected_sink_ids, result.affected_sink_ids)
+
+
+def build_sources_demo():
+    """双水源管网：
+
+    S1 --P1(v)-- A --P4(v)-- D --P6(无阀)-- U3
+    S2 --P2(v)-- A --P3(v)-- U1
+    """
+    nodes = {
+        "S1": Node("S1", "source"),
+        "S2": Node("S2", "source"),
+        "A": Node("A", "junction"),
+        "D": Node("D", "junction"),
+        "U1": Node("U1", "sink"),
+        "U3": Node("U3", "sink"),
+    }
+    pipes = {
+        "P1": Pipe("P1", "S1", "A", has_valve=True),
+        "P2": Pipe("P2", "S2", "A", has_valve=True),
+        "P3": Pipe("P3", "A", "U1", has_valve=True),
+        "P4": Pipe("P4", "A", "D", has_valve=True),
+        "P6": Pipe("P6", "D", "U3", has_valve=False),
+    }
+    return nodes, pipes
+
+
+class SourceSwitchPlanningTests(unittest.TestCase):
+    def test_stop_redundant_source_no_loss(self):
+        nodes, pipes = build_sources_demo()
+        result = evaluate_source_switch(nodes, pipes, [("S2", False)])
+        self.assertTrue(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.new_loss_sink_ids, [])
+        self.assertEqual(result.restored_sink_ids, [])
+        self.assertEqual(result.issues, [])
+        self.assertEqual(result.running_source_ids, ["S1"])
+
+    def test_stop_last_source_loses_all_sinks(self):
+        nodes, pipes = build_sources_demo()
+        nodes["S2"] = Node("S2", "source", running=False)
+        result = evaluate_source_switch(nodes, pipes, [("S1", False)])
+        self.assertTrue(result.changed)
+        self.assertTrue(result.safe)  # 停运允许全网无运行水源
+        self.assertEqual(result.new_loss_sink_ids, ["U1", "U3"])
+        self.assertEqual(result.running_source_ids, [])
+
+    def test_stop_and_restoration_diff_sets(self):
+        nodes, pipes = build_sources_demo()
+        # S2 已停运：恢复 S2，新增失供为空，用水点全部本就可达
+        nodes["S2"] = Node("S2", "source", running=False)
+        result = evaluate_source_switch(nodes, pipes, [("S2", True)])
+        self.assertTrue(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.new_loss_sink_ids, [])
+        self.assertEqual(result.restored_sink_ids, [])
+        self.assertEqual(result.running_source_ids, ["S1", "S2"])
+
+        # 双源均停运后恢复 S1：U1/U3 恢复供水
+        nodes["S1"] = Node("S1", "source", running=False)
+        result = evaluate_source_switch(nodes, pipes, [("S1", True)])
+        self.assertEqual(result.restored_sink_ids, ["U1", "U3"])
+
+    def test_all_targets_already_satisfied_is_noop(self):
+        nodes, pipes = build_sources_demo()
+        result = evaluate_source_switch(nodes, pipes, [("S1", True), ("S2", True)])
+        self.assertFalse(result.changed)
+        self.assertTrue(result.safe)
+        self.assertEqual(result.new_loss_sink_ids, [])
+        self.assertEqual(result.restored_sink_ids, [])
+        self.assertEqual(result.running_source_ids, ["S1", "S2"])
+
+    def test_restore_blocked_when_pending_fault_end_gets_water(self):
+        nodes, pipes = build_sources_demo()
+        # 双源停运；待修复故障 P6（D-U3），P4 开启：恢复 S1 会让 P6 的 D 端进水
+        nodes["S1"] = Node("S1", "source", running=False)
+        nodes["S2"] = Node("S2", "source", running=False)
+        result = evaluate_source_switch(
+            nodes, pipes, [("S1", True)],
+            pending_fault_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertFalse(result.safe)
+        self.assertEqual(len(result.blocks), 1)
+        block = result.blocks[0]
+        self.assertEqual(block.fault_pipe_id, "P6")
+        self.assertEqual(block.reachable_endpoints, ["D"])
+        self.assertEqual(block.as_dict()["code"], FAULT_REWATER_RISK)
+
+    def test_closed_valve_still_blocks_after_restoration(self):
+        nodes, pipes = build_sources_demo()
+        # P4 已关闭隔离 D 区，P6 待修复：恢复 S1 后 D 端仍不可达 -> 安全
+        nodes["S1"] = Node("S1", "source", running=False)
+        nodes["S2"] = Node("S2", "source", running=False)
+        pipes["P4"] = Pipe("P4", "A", "D", has_valve=True, valve_closed=True)
+        result = evaluate_source_switch(
+            nodes, pipes, [("S1", True)],
+            pending_fault_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertTrue(result.safe)
+        self.assertEqual(result.blocks, [])
+        # U1 恢复；U3 被已关 P4 与待修复 P6 双重阻断，不恢复
+        self.assertEqual(result.restored_sink_ids, ["U1"])
+
+    def test_pending_fault_pipe_itself_blocks_restoration(self):
+        # 故障管段本身仍阻断通水：恢复水源不穿透待修复故障管段
+        nodes, pipes = build_sources_demo()
+        nodes["S1"] = Node("S1", "source", running=False)
+        nodes["S2"] = Node("S2", "source", running=False)
+        # P4 关闭、P6 待修复：U3 经 P6 自身阻断也不会恢复，且只有 U3 端不可达
+        pipes["P4"] = Pipe("P4", "A", "D", has_valve=True, valve_closed=True)
+        result = evaluate_source_switch(
+            nodes, pipes, [("S1", True)],
+            pending_fault_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertTrue(result.safe)
+        self.assertNotIn("U3", result.restored_sink_ids)
+
+    def test_pure_stop_never_raises_rewater_risk(self):
+        nodes, pipes = build_sources_demo()
+        # 即便待修复 P6 当前两端都可达（未隔离），纯停运只减水、不新增进水
+        result = evaluate_source_switch(
+            nodes, pipes, [("S1", False)],
+            pending_fault_pipe_ids=frozenset({"P6"}),
+        )
+        self.assertTrue(result.safe)
+        self.assertEqual(result.blocks, [])
+
+    def test_invalid_source_ids_and_duplicates(self):
+        nodes, pipes = build_sources_demo()
+        result = evaluate_source_switch(nodes, pipes, [("A", True)])
+        self.assertEqual([i.code for i in result.issues], [SOURCE_NOT_FOUND])
+        self.assertFalse(result.safe)
+        self.assertFalse(result.changed)
+
+        result = evaluate_source_switch(
+            nodes, pipes, [("S1", False), ("S1", True)]
+        )
+        codes = [i.code for i in result.issues]
+        self.assertEqual(codes, [SOURCE_SWITCH_DUPLICATE])
+
+        result = evaluate_source_switch(nodes, pipes, [("SX", False), ("U1", True)])
+        self.assertEqual(
+            [i.code for i in result.issues],
+            [SOURCE_NOT_FOUND, SOURCE_NOT_FOUND],
+        )
+
+    def test_stopped_source_excluded_from_all_water_calculations(self):
+        # 隔离/关阀建议/复供均只按运行水源计算
+        nodes, pipes = build_sources_demo()
+        nodes["S1"] = Node("S1", "source", running=False)
+        # S1 停运后 P1 背后无运行水源：P6 关 P4 仍可隔离（只看运行的 S2）
+        result = evaluate_plan(nodes, pipes, "P6", ["P4"])
+        self.assertTrue(result.isolatable)
+        self.assertEqual(result.affected_sink_ids, ["U3"])
+
+        # 复供：无运行水源时重开阀门不恢复任何用水点
+        nodes["S2"] = Node("S2", "source", running=False)
+        pipes["P4"] = Pipe("P4", "A", "D", has_valve=True, valve_closed=True)
+        restore = evaluate_restore(
+            nodes, pipes,
+            reopen_pipe_ids=frozenset({"P4"}),
+            other_fault_pipe_ids=frozenset(),
+        )
+        self.assertTrue(restore.safe)
+        self.assertEqual(restore.restored_sink_ids, [])
 
 
 if __name__ == "__main__":

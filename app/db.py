@@ -1,4 +1,4 @@
-"""PostgreSQL 访问层：建表、快照读取、整网导入、隔离提交。"""
+"""PostgreSQL 访问层：建表、快照、整网导入、隔离提交、复供与水源切换。"""
 from __future__ import annotations
 
 import json
@@ -29,8 +29,12 @@ ON CONFLICT (id) DO NOTHING;
 CREATE TABLE IF NOT EXISTS nodes (
     id     TEXT PRIMARY KEY,
     type   TEXT NOT NULL CHECK (type IN ('source', 'sink', 'junction')),
-    name   TEXT
+    name   TEXT,
+    running BOOLEAN NOT NULL DEFAULT TRUE
 );
+
+-- 兼容旧库：补水源运行状态列（既有节点初始视为运行）
+ALTER TABLE nodes ADD COLUMN IF NOT EXISTS running BOOLEAN NOT NULL DEFAULT TRUE;
 
 CREATE TABLE IF NOT EXISTS pipes (
     id           TEXT PRIMARY KEY,
@@ -133,9 +137,14 @@ def load_snapshot(conn, *, for_update: bool = False) -> tuple[int, datetime | No
         version = row["version"] if row else 0
         updated_at = row["updated_at"] if row else None
 
-        cur.execute("SELECT id, type, name FROM nodes")
+        cur.execute("SELECT id, type, name, running FROM nodes")
         nodes = {
-            r["id"]: Node(id=r["id"], type=r["type"], name=r["name"])
+            r["id"]: Node(
+                id=r["id"],
+                type=r["type"],
+                name=r["name"],
+                running=r["running"],
+            )
             for r in cur.fetchall()
         }
 
@@ -176,8 +185,9 @@ def replace_network(conn, nodes: list[Node], pipes: list[Pipe]) -> int:
         cur.execute("TRUNCATE nodes")
 
         cur.executemany(
-            "INSERT INTO nodes (id, type, name) VALUES (%s, %s, %s)",
-            [(n.id, n.type, n.name) for n in nodes],
+            "INSERT INTO nodes (id, type, name, running) VALUES (%s, %s, %s, %s)",
+            # 整网导入的节点重新定义：水源初始视为运行，其余节点恒为运行
+            [(n.id, n.type, n.name, True) for n in nodes],
         )
         cur.executemany(
             "INSERT INTO pipes (id, from_node, to_node, has_valve, valve_closed, name) "
@@ -358,6 +368,47 @@ def confirm_restore(
         "version": new_version,
         "restored_at": restored_at,
     }
+
+
+# ---------------------------------------------------------------- 水源调度
+
+
+def switch_sources(
+    conn,
+    expected_version: int,
+    changed_targets: dict[str, bool],
+) -> int:
+    """在已开启的事务内完成水源停运/恢复确认。
+
+    调用方须先用 for_update 快照重新评估编号合法性、是否有状态变化与安全性。
+    本函数只负责：锁行版本比对 → 原子更新水源运行状态与版本；
+    changed_targets 只包含目标状态与当前不同的水源，
+    全部目标已满足（空字典）时不推进版本。版本过期抛出 VersionConflict。
+    """
+    with conn.cursor() as cur:
+        cur.execute("SELECT version FROM network_meta WHERE id = 1 FOR UPDATE")
+        row = cur.fetchone()
+        current_version = row[0] if row else 0
+        if current_version != expected_version:
+            raise VersionConflict(current_version, expected_version)
+
+        if not changed_targets:
+            return current_version
+
+        for source_id, running in changed_targets.items():
+            cur.execute(
+                "UPDATE nodes SET running = %s WHERE id = %s AND type = 'source'",
+                (running, source_id),
+            )
+            if cur.rowcount != 1:  # 防御性校验：调用方已基于锁定快照复核编号
+                raise RuntimeError(f"水源节点不存在或已变化：{source_id}")
+
+        new_version = current_version + 1
+        cur.execute(
+            "UPDATE network_meta SET version = %s, updated_at = now() WHERE id = 1",
+            (new_version,),
+        )
+    return new_version
 
 
 # ---------------------------------------------------------------- 历史

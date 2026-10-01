@@ -1,0 +1,17 @@
+{
+  "nodes": [
+    {"id": "S1", "type": "source",   "name": "江北水厂"},
+    {"id": "S2", "type": "source",   "name": "江南水厂"},
+    {"id": "A",  "type": "junction", "name": "汇合点"},
+    {"id": "D",  "type": "junction", "name": "东郊连接点"},
+    {"id": "U1", "type": "sink",     "name": "幸福小区"},
+    {"id": "U3", "type": "sink",     "name": "东郊工业园"}
+  ],
+  "pipes": [
+    {"id": "P1", "from": "S1", "to": "A", "has_valve": true, "name": "江北出厂干管"},
+    {"id": "P2", "from": "S2", "to": "A", "has_valve": true, "name": "江南出厂干管"},
+    {"id": "P3", "from": "A",  "to": "U1", "has_valve": true},
+    {"id": "P4", "from": "A",  "to": "D", "has_valve": true, "name": "东郊进口阀"},
+    {"id": "P6", "from": "D",  "to": "U3", "has_valve": false, "name": "故障管段"}
+  ]
+}
